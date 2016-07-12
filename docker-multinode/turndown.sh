@@ -17,6 +17,12 @@
 # Source common.sh
 source $(dirname "${BASH_SOURCE}")/common.sh
 
+if [[ ${USE_NETWORK_CNI_PLUGIN} = "true" ]]; then
+  source $(dirname "${BASH_SOURCE}")/cni-plugin.sh
+else
+  source $(dirname "${BASH_SOURCE}")/docker-bootstrap.sh
+fi
+
 kube::multinode::main
 
 # Turndown kubernetes in docker

@@ -27,15 +27,23 @@ kube::multinode::main
 
 kube::multinode::check_params
 
-kube::multinode::detect_lsb
-
 kube::multinode::turndown
 
-kube::multinode::bootstrap_daemon
+if [[ ${USE_CNI} == "true" ]]; then
 
-kube::multinode::start_flannel
+  kube::cni::restart_docker
 
-kube::multinode::restart_docker
+  kube::multinode::start_flannel
+else
+
+  kube::bootstrap::detect_lsb
+
+  kube::bootstrap::bootstrap_daemon
+
+  kube::multinode::start_flannel
+
+  kube::bootstrap::restart_docker
+fi
 
 kube::multinode::start_k8s_worker
 

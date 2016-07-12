@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 # Source common.sh
 source $(dirname "${BASH_SOURCE}")/common.sh
 
@@ -26,17 +27,30 @@ kube::multinode::main
 
 kube::multinode::check_params
 
-kube::multinode::detect_lsb
-
 kube::multinode::turndown
 
-kube::multinode::bootstrap_daemon
 
-kube::multinode::start_etcd
+if [[ ${USE_CNI} == "true" ]]; then
+  source $(dirname "${BASH_SOURCE}")/cni-plugin.sh
 
-kube::multinode::start_flannel
+  kube::cni::restart_docker
 
-kube::multinode::restart_docker
+  kube::multinode::start_etcd
+
+  kube::multinode::start_flannel
+else
+  source $(dirname "${BASH_SOURCE}")/docker-bootstrap.sh
+
+  kube::bootstrap::detect_lsb
+
+  kube::bootstrap::bootstrap_daemon
+
+  kube::multinode::start_etcd
+
+  kube::multinode::start_flannel
+
+  kube::bootstrap::restart_docker
+fi
 
 kube::multinode::start_k8s_master
 

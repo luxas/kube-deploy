@@ -15,9 +15,13 @@
 # limitations under the License.
 
 # Utility functions for Kubernetes in docker setup
+source $(dirname "${BASH_SOURCE}")/cni-plugin.sh
+source $(dirname "${BASH_SOURCE}")/docker-bootstrap.sh
+#set -x
 
 kube::multinode::main(){
-  LATEST_STABLE_K8S_VERSION=$(kube::helpers::curl "https://storage.googleapis.com/kubernetes-release/release/stable.txt")
+
+  LATEST_STABLE_K8S_VERSION=$(kube::helpers::curl "https://storage.googleapis.com/kubernetes-release/release/stable.txt" || echo "v1.3.0")
   K8S_VERSION=${K8S_VERSION:-${LATEST_STABLE_K8S_VERSION}}
 
   ETCD_VERSION=${ETCD_VERSION:-"2.2.5"}
@@ -37,16 +41,32 @@ kube::multinode::main(){
 
   # Constants
   TIMEOUT_FOR_SERVICES=20
-  BOOTSTRAP_DOCKER_SOCK="unix:///var/run/docker-bootstrap.sock"
+  FLANNEL_SUBNET_TMPDIR=$(mktemp -d)
   KUBELET_MOUNTS="\
     -v /sys:/sys:rw \
     -v /var/run:/var/run:rw \
     -v /var/lib/docker:/var/lib/docker:rw \
     -v /var/lib/kubelet:/var/lib/kubelet:shared \
-    -v /var/log/containers:/var/log/containers:rw"
+    -v /var/log/containers:/var/log/containers:rw \
+    -v ${FLANNEL_SUBNET_TMPDIR}/subnet.env:/run/flannel/subnet.env"
 
-  # Paths
-  FLANNEL_SUBNET_TMPDIR=$(mktemp -d)
+  kube::helpers::parse_version ${K8S_VERSION}
+
+  if [[ ${USE_CNI:-"true"} == "true" && \
+      (${ARCH} == "amd64" && \
+      ${VERSION_MAJOR} == 1 && \
+      $((VERSION_MINOR >= 3)) == 1) ]]; then
+
+    USE_CNI="true"
+    BOOTSTRAP_SOCK=""
+    CNI_ARGS="\
+      --network-plugin=cni \
+      --network-plugin-dir=/etc/cni/net.d"
+  else
+    USE_CNI="false"
+    OLD_BOOTSTRAP_SOCK="-H unix:///var/run/docker-bootstrap.sock"
+    CNI_ARGS=""
+  fi
 
   # Trap errors
   kube::log::install_errexit
@@ -74,8 +94,6 @@ kube::multinode::check_params() {
     exit 1
   fi
 
-  kube::helpers::parse_version ${K8S_VERSION}
-
   # Output the value of the variables
   kube::log::status "K8S_VERSION is set to: ${K8S_VERSION}"
   kube::log::status "ETCD_VERSION is set to: ${ETCD_VERSION}"
@@ -87,66 +105,8 @@ kube::multinode::check_params() {
   kube::log::status "MASTER_IP is set to: ${MASTER_IP}"
   kube::log::status "ARCH is set to: ${ARCH}"
   kube::log::status "NET_INTERFACE is set to: ${NET_INTERFACE}"
+  kube::log::status "USE_CNI is set to: ${USE_CNI}"
   kube::log::status "--------------------------------------------"
-}
-
-# Detect the OS distro, we support ubuntu, debian, mint, centos, fedora and systemd dist
-kube::multinode::detect_lsb() {
-
-  if kube::helpers::command_exists lsb_release; then
-    lsb_dist="$(lsb_release -si)"
-  elif [[ -r /etc/lsb-release ]]; then
-    lsb_dist="$(. /etc/lsb-release && echo "$DISTRIB_ID")"
-  elif [[ -r /etc/debian_version ]]; then
-    lsb_dist='debian'
-  elif [[ -r /etc/fedora-release ]]; then
-    lsb_dist='fedora'
-  elif [[ -r /etc/os-release ]]; then
-    lsb_dist="$(. /etc/os-release && echo "$ID")"
-  elif kube::helpers::command_exists systemctl; then
-    lsb_dist='systemd'
-  fi
-
-  lsb_dist="$(echo ${lsb_dist} | tr '[:upper:]' '[:lower:]')"
-
-  case "${lsb_dist}" in
-      amzn|centos|debian|ubuntu|systemd)
-        ;;
-      *)
-        kube::log::error "Error: We currently only support ubuntu|debian|amzn|centos|systemd."
-        exit 1
-        ;;
-  esac
-
-  kube::log::status "Detected OS: ${lsb_dist}"
-}
-
-# Start a docker bootstrap for running etcd and flannel
-kube::multinode::bootstrap_daemon() {
-
-  kube::log::status "Launching docker bootstrap..."
-
-  docker daemon \
-    -H ${BOOTSTRAP_DOCKER_SOCK} \
-    -p /var/run/docker-bootstrap.pid \
-    --iptables=false \
-    --ip-masq=false \
-    --bridge=none \
-    --graph=/var/lib/docker-bootstrap \
-    --exec-root=/var/run/docker-bootstrap \
-      2> /var/log/docker-bootstrap.log \
-      1> /dev/null &
-
-  # Wait for docker bootstrap to start by "docker ps"-ing every second
-  local SECONDS=0
-  while [[ $(docker -H ${BOOTSTRAP_DOCKER_SOCK} ps 2>&1 1>/dev/null; echo $?) != 0 ]]; do
-    ((SECONDS++))
-    if [[ ${SECONDS} == ${TIMEOUT_FOR_SERVICES} ]]; then
-      kube::log::error "docker bootstrap failed to start. Exiting..."
-      exit
-    fi
-    sleep 1
-  done
 }
 
 # Start etcd on the master node
@@ -154,7 +114,7 @@ kube::multinode::start_etcd() {
 
   kube::log::status "Launching etcd..."
   
-  docker -H ${BOOTSTRAP_DOCKER_SOCK} run -d \
+  docker ${OLD_BOOTSTRAP_SOCK} run -d \
     --restart=${RESTART_POLICY} \
     --net=host \
     gcr.io/google_containers/etcd-${ARCH}:${ETCD_VERSION} \
@@ -164,9 +124,9 @@ kube::multinode::start_etcd() {
       --data-dir=/var/etcd/data
 
   # Wait for etcd to come up
-  local SECONDS=0
+  SECONDS=0
   while [[ $(curl -fs http://localhost:4001/v2/machines 2>&1 1>/dev/null; echo $?) != 0 ]]; do
-    ((SECONDS++))
+    ((SECONDS=$SECONDS+1))
     if [[ ${SECONDS} == ${TIMEOUT_FOR_SERVICES} ]]; then
       kube::log::error "etcd failed to start. Exiting..."
       exit
@@ -174,23 +134,26 @@ kube::multinode::start_etcd() {
     sleep 1
   done
 
+  sleep 2
+
   # Set flannel net config
-  docker -H ${BOOTSTRAP_DOCKER_SOCK} run \
-      --net=host \
-      gcr.io/google_containers/etcd-${ARCH}:${ETCD_VERSION} \
-      etcdctl \
-      set /coreos.com/network/config \
-          "{ \"Network\": \"${FLANNEL_NETWORK}\", \"Backend\": {\"Type\": \"${FLANNEL_BACKEND}\"}}"
+  docker ${OLD_BOOTSTRAP_SOCK} run \
+    --rm \
+    --net=host \
+    gcr.io/google_containers/etcd-${ARCH}:${ETCD_VERSION} \
+    etcdctl \
+    set /coreos.com/network/config \
+      "{ \"Network\": \"${FLANNEL_NETWORK}\", \"Backend\": {\"Type\": \"${FLANNEL_BACKEND}\"}}"
 
   sleep 2
 }
 
-# Start flannel in docker bootstrap, both for master and worker
+# Start flannel
 kube::multinode::start_flannel() {
 
   kube::log::status "Launching flannel..."
 
-  docker -H ${BOOTSTRAP_DOCKER_SOCK} run -d \
+  docker ${OLD_BOOTSTRAP_SOCK} run -d \
     --restart=${RESTART_POLICY} \
     --net=host \
     --privileged \
@@ -203,9 +166,9 @@ kube::multinode::start_flannel() {
       --iface="${NET_INTERFACE}"
 
   # Wait for the flannel subnet.env file to be created instead of a timeout. This is faster and more reliable
-  local SECONDS=0
+  SECONDS=0
   while [[ ! -f ${FLANNEL_SUBNET_TMPDIR}/subnet.env ]]; do
-    ((SECONDS++))
+    ((SECONDS=$SECONDS+1))
     if [[ ${SECONDS} == ${TIMEOUT_FOR_SERVICES} ]]; then
       kube::log::error "flannel failed to start. Exiting..."
       exit
@@ -217,113 +180,6 @@ kube::multinode::start_flannel() {
 
   kube::log::status "FLANNEL_SUBNET is set to: ${FLANNEL_SUBNET}"
   kube::log::status "FLANNEL_MTU is set to: ${FLANNEL_MTU}"
-}
-
-# Configure docker net settings, then restart it
-kube::multinode::restart_docker(){
-
-  kube::log::status "Restarting main docker daemon..."
-
-  case "${lsb_dist}" in
-    amzn)
-      DOCKER_CONF="/etc/sysconfig/docker"
-      kube::helpers::backup_file ${DOCKER_CONF}
-
-      if ! kube::helpers::command_exists ifconfig; then
-        yum -y -q install net-tools
-      fi
-      if ! kube::helpers::command_exists brctl; then
-        yum -y -q install bridge-utils
-      fi
-
-      # Is there an uncommented OPTIONS line at all?
-      if [[ -z $(grep "OPTIONS" ${DOCKER_CONF} | grep -v "#") ]]; then
-        echo "OPTIONS=\"--mtu=${FLANNEL_MTU} --bip=${FLANNEL_SUBNET}\"" >> ${DOCKER_CONF}
-      else
-        kube::helpers::replace_mtu_bip ${DOCKER_CONF} "OPTIONS"
-      fi
-
-      ifconfig docker0 down
-      brctl delbr docker0 
-      service docker restart
-      ;;
-    centos)
-      if ! kube::helpers::command_exists ifconfig; then
-        yum -y -q install net-tools
-      fi
-      if ! kube::helpers::command_exists brctl; then
-        yum -y -q install bridge-utils
-      fi
-      
-      # Newer centos releases uses systemd. Handle that
-      if kube::helpers::command_exists systemctl; then
-        kube::multinode::restart_docker_systemd
-      else
-        DOCKER_CONF="/etc/sysconfig/docker"
-        kube::helpers::backup_file ${DOCKER_CONF}
-
-        # Is there an uncommented OPTIONS line at all?
-        if [[ -z $(grep "OPTIONS" ${DOCKER_CONF} | grep -v "#") ]]; then
-          echo "OPTIONS=\"--mtu=${FLANNEL_MTU} --bip=${FLANNEL_SUBNET}\"" >> ${DOCKER_CONF}
-        else
-          kube::helpers::replace_mtu_bip ${DOCKER_CONF} "OPTIONS"
-        fi
-
-        ifconfig docker0 down
-        brctl delbr docker0 
-        systemctl restart docker
-      fi
-      ;;
-    ubuntu|debian)
-      if ! kube::helpers::command_exists brctl; then
-        apt-get install -y bridge-utils 
-      fi
-
-      # Newer ubuntu and debian releases uses systemd. Handle that
-      if kube::helpers::command_exists systemctl; then
-        kube::multinode::restart_docker_systemd
-      else
-        DOCKER_CONF="/etc/default/docker"
-        kube::helpers::backup_file ${DOCKER_CONF}
-        
-        # Is there an uncommented DOCKER_OPTS line at all?
-        if [[ -z $(grep "DOCKER_OPTS" $DOCKER_CONF | grep -v "#") ]]; then
-          echo "DOCKER_OPTS=\"--mtu=${FLANNEL_MTU} --bip=${FLANNEL_SUBNET}\"" >> ${DOCKER_CONF}
-        else
-          kube::helpers::replace_mtu_bip ${DOCKER_CONF} "DOCKER_OPTS"
-        fi
-
-        ifconfig docker0 down
-        brctl delbr docker0 
-        service docker stop
-        while [[ $(ps aux | grep $(which docker) | grep -v grep | wc -l) -gt 0 ]]; do
-            kube::log::status "Waiting for docker to terminate"
-            sleep 1
-        done
-        service docker start
-      fi
-      ;;
-    systemd)
-      kube::multinode::restart_docker_systemd
-      ;;
-  esac
-
-  kube::log::status "Restarted docker with the new flannel settings"
-}
-
-# Replace --mtu and --bip in systemd's docker.service file and restart
-kube::multinode::restart_docker_systemd(){
-
-  DOCKER_CONF=$(systemctl cat docker | head -1 | awk '{print $2}')
-  kube::helpers::backup_file ${DOCKER_CONF}
-  kube::helpers::replace_mtu_bip ${DOCKER_CONF} $(which docker)
-
-  ifconfig docker0 down
-  brctl delbr docker0
-
-  sed -i.bak 's/^\(MountFlags=\).*/\1shared/' ${DOCKER_CONF}
-  systemctl daemon-reload
-  systemctl restart docker
 }
 
 # Start kubelet first and then the master components as pods
@@ -345,8 +201,7 @@ kube::multinode::start_k8s_master() {
       --allow-privileged \
       --api-servers=http://localhost:8080 \
       --config=/etc/kubernetes/manifests-multi \
-      --cluster-dns=10.0.0.10 \
-      --cluster-domain=cluster.local \
+      ${CNI_ARGS} \
       --hostname-override=$(ip -o -4 addr list ${NET_INTERFACE} | awk '{print $4}' | cut -d/ -f1) \
       --v=2
 }
@@ -370,8 +225,7 @@ kube::multinode::start_k8s_worker() {
     /hyperkube kubelet \
       --allow-privileged \
       --api-servers=http://${MASTER_IP}:8080 \
-      --cluster-dns=10.0.0.10 \
-      --cluster-domain=cluster.local \
+      ${CNI_ARGS} \
       --hostname-override=$(ip -o -4 addr list ${NET_INTERFACE} | awk '{print $4}' | cut -d/ -f1) \
       --v=2
 }
@@ -404,17 +258,17 @@ kube::multinode::start_k8s_worker_proxy() {
 kube::multinode::turndown(){
 
   # Check if docker bootstrap is running
-  if [[ $(kube::helpers::is_running ${BOOTSTRAP_DOCKER_SOCK}) == "true" ]]; then
+  if [[ ${USE_CNI} == "false" && $(kube::helpers::is_running "${OLD_BOOTSTRAP_SOCK}") == "true" ]]; then
 
     kube::log::status "Killing docker bootstrap..."
 
     # Kill all docker bootstrap's containers
-    if [[ $(docker -H ${BOOTSTRAP_DOCKER_SOCK} ps -q | wc -l) != 0 ]]; then
-      docker -H ${BOOTSTRAP_DOCKER_SOCK} rm -f $(docker -H ${BOOTSTRAP_DOCKER_SOCK} ps -q)
+    if [[ $(docker ${OLD_BOOTSTRAP_SOCK} ps -q | wc -l) != 0 ]]; then
+      docker ${OLD_BOOTSTRAP_SOCK} rm -f $(docker ${OLD_BOOTSTRAP_SOCK} ps -q)
     fi
 
     # Kill bootstrap docker
-    kill $(ps aux | grep ${BOOTSTRAP_DOCKER_SOCK} | grep -v grep | awk '{print $2}')
+    kill $(ps aux | grep -- "${OLD_BOOTSTRAP_SOCK}" | grep -v "grep" | awk '{print $2}')
 
   fi
 
@@ -457,8 +311,8 @@ kube::multinode::turndown(){
         if [[ ! -z $(mount | grep /var/lib/kubelet | awk '{print $3}') ]]; then
 
           # The umount command may be a little bit subborn sometimes, so run the commands twice to ensure the mounts are gone
-          mount | grep /var/lib/kubelet/* | awk '{print $3}' | xargs umount 1>/dev/null 2>/dev/null
-          mount | grep /var/lib/kubelet/* | awk '{print $3}' | xargs umount 1>/dev/null 2>/dev/null
+          mount | grep /var/lib/kubelet | awk '{print $3}' | xargs umount 1>/dev/null 2>/dev/null
+          mount | grep /var/lib/kubelet | awk '{print $3}' | xargs umount 1>/dev/null 2>/dev/null
           umount /var/lib/kubelet 1>/dev/null 2>/dev/null
           umount /var/lib/kubelet 1>/dev/null 2>/dev/null
         fi
@@ -470,7 +324,6 @@ kube::multinode::turndown(){
   fi
 }
 
-
 ## Helpers
 
 # Check if a command is valid
@@ -478,41 +331,9 @@ kube::helpers::command_exists() {
     command -v "$@" > /dev/null 2>&1
 }
 
-# Usage: kube::helpers::file_replace_line {path_to_file} {value_to_search_for} {replace_that_line_with_this_content}
-# Finds a line in a file and replaces the line with the third argument
-kube::helpers::file_replace_line(){
-  if [[ -z $(grep "$2" $1) ]]; then
-    echo "$3" >> $1
-  else
-    sed -i "/$2/c\\$3" $1
-  fi
-}
-
-kube::helpers::replace_mtu_bip(){
-  local DOCKER_CONF=$1
-  local SEARCH_FOR=$2
-
-  # Assuming is a $SEARCH_FOR statement already, and we should append the options if they do not exist
-  if [[ -z $(grep -- "--mtu=" $DOCKER_CONF) ]]; then
-    sed -e "s@$(grep "$SEARCH_FOR" $DOCKER_CONF)@$(grep "$SEARCH_FOR" $DOCKER_CONF) --mtu=${FLANNEL_MTU}@g" -i $DOCKER_CONF
-  fi
-  if [[ -z $(grep -- "--bip=" $DOCKER_CONF) ]]; then
-    sed -e "s@$(grep "$SEARCH_FOR" $DOCKER_CONF)@$(grep "$SEARCH_FOR" $DOCKER_CONF) --bip=${FLANNEL_SUBNET}@g" -i $DOCKER_CONF
-  fi
-
-  # Finds "--mtu=????" and replaces with "--mtu=${FLANNEL_MTU}"
-  # Also finds "--bip=??.??.??.??" and replaces with "--bip=${FLANNEL_SUBNET}"
-  sed -e "s@$(grep -o -- "--mtu=[[:graph:]]*" $DOCKER_CONF)@--mtu=${FLANNEL_MTU}@g;s@$(grep -o -- "--bip=[[:graph:]]*" $DOCKER_CONF)@--bip=${FLANNEL_SUBNET}@g" -i $DOCKER_CONF
-}
-
-kube::helpers::backup_file(){
-  # Backup the current file
-  cp -f ${1} ${1}.backup
-}
-
 # Check if a process is running
 kube::helpers::is_running(){
-  if [[ ! -z $(ps aux | grep ${1} | grep -v grep) ]]; then
+  if [[ ! -z $(ps aux | grep -- "${1}" | grep -v "grep") ]]; then
     echo "true"
   else
     echo "false"
